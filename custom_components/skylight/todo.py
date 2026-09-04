@@ -16,9 +16,10 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .api import SkylightAPI
-from .const import DOMAIN
+from .const import CHORE_COMPLETE_STATUSES, DOMAIN
 from .coordinator import SkylightListsCoordinator, SkylightSensorCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -95,6 +96,63 @@ def _profile_categories(data: dict) -> list[tuple[str, str]]:
     return out
 
 
+def _list_item_status(status: TodoItemStatus | None) -> str:
+    """HA todo status → the ``pending``/``completed`` a *list item* uses.
+
+    Deliberately not shared with chores: a chore's finished state is the literal
+    ``complete``, and it's set through a separate endpoint rather than as a
+    field. Merging the two is what made ticking a chore silently do nothing.
+    """
+    return "completed" if status == TodoItemStatus.COMPLETED else "pending"
+
+
+def _chore_is_complete(attrs: dict) -> bool:
+    """Whether a chore counts as done.
+
+    Checks the completion timestamps as well as ``status`` on purpose. A filled
+    ``completed_on`` / ``completed_at`` is unambiguous, and it covers the case
+    where the chore *list* feed represents completion differently from the
+    completions response — recurring chores expand into per-occurrence records
+    (note the ``group``/``series`` fields), so an occurrence may well carry the
+    date without the parent's status changing.
+    """
+    if str(attrs.get("status") or "") in CHORE_COMPLETE_STATUSES:
+        return True
+    return bool(attrs.get("completed_on") or attrs.get("completed_at"))
+
+
+def _split_chore_uid(uid: str) -> tuple[str, str | None]:
+    """Chore uid → its ``(series_id, occurrence_date)``.
+
+    A recurring chore is listed once per occurrence under a composite id —
+    ``101940933-2026-08-28`` — while one-off chores keep the bare series number.
+    Every chore route is keyed on the series id alone, so the composite form has
+    to be taken apart before it can be put in a URL; the date half is what
+    ``instance_date`` wants.
+    """
+    series, sep, suffix = uid.partition("-")
+    if sep and series.isdigit():
+        try:
+            return series, date.fromisoformat(suffix).isoformat()
+        except ValueError:
+            pass
+    return uid, None
+
+
+def _chore_start(due: date | datetime | None) -> str:
+    """Map a HA due date onto a chore's ``start``.
+
+    Skylight chores are day-scoped, so a due *datetime* loses its time component.
+    An item with no due date lands on today, matching what the frame does when a
+    chore is added from its touchscreen.
+    """
+    if isinstance(due, datetime):
+        return due.date().isoformat()
+    if isinstance(due, date):
+        return due.isoformat()
+    return dt_util.now().date().isoformat()
+
+
 class SkylightTodoList(CoordinatorEntity[SkylightListsCoordinator], TodoListEntity):
     _attr_has_entity_name = True
     _attr_supported_features = (
@@ -149,11 +207,7 @@ class SkylightTodoList(CoordinatorEntity[SkylightListsCoordinator], TodoListEnti
         if item.summary is not None:
             attrs["name"] = item.summary
         if item.status is not None:
-            attrs["status"] = (
-                "completed"
-                if item.status == TodoItemStatus.COMPLETED
-                else "pending"
-            )
+            attrs["status"] = _list_item_status(item.status)
         if attrs and item.uid:
             await self._api.update_list_item(
                 self._frame_id, self.list_id, item.uid, attrs
@@ -171,13 +225,19 @@ class SkylightMemberChoreTodo(
 ):
     """A single family member's chore queue as a HA Todo entity.
 
-    Read-only for create/delete (Skylight chore CRUD is nontrivial from the app UX),
-    but supports UPDATE so you can mark a chore complete from HA and it round-trips
-    to the frame + rewards ledger.
+    Full CRUD: chores created here are assigned to this member's category, and
+    completing one round-trips to the frame plus the rewards ledger. A chore's
+    due date maps onto its ``start`` day.
     """
 
     _attr_has_entity_name = True
-    _attr_supported_features = TodoListEntityFeature.UPDATE_TODO_ITEM
+    _attr_supported_features = (
+        TodoListEntityFeature.CREATE_TODO_ITEM
+        | TodoListEntityFeature.UPDATE_TODO_ITEM
+        | TodoListEntityFeature.DELETE_TODO_ITEM
+        | TodoListEntityFeature.SET_DUE_DATE_ON_ITEM
+        | TodoListEntityFeature.SET_DESCRIPTION_ON_ITEM
+    )
 
     def __init__(
         self,
@@ -223,7 +283,7 @@ class SkylightMemberChoreTodo(
             summary = attrs.get("summary") or attrs.get("name") or "Chore"
             status = (
                 TodoItemStatus.COMPLETED
-                if attrs.get("status") == "completed"
+                if _chore_is_complete(attrs)
                 else TodoItemStatus.NEEDS_ACTION
             )
             uid = str(c.get("id"))
@@ -240,17 +300,78 @@ class SkylightMemberChoreTodo(
                 except ValueError:
                     due = None
             result.append(
-                TodoItem(summary=summary, uid=uid, status=status, due=due)
+                TodoItem(
+                    summary=summary,
+                    uid=uid,
+                    status=status,
+                    due=due,
+                    description=attrs.get("description") or None,
+                )
             )
         return result
 
-    async def async_update_todo_item(self, item: TodoItem) -> None:
-        if not item.uid or item.status is None:
-            return
-        status = (
-            "completed"
-            if item.status == TodoItemStatus.COMPLETED
-            else "pending"
+    async def async_create_todo_item(self, item: TodoItem) -> None:
+        # Skylight's create route takes no status, so a new chore always starts
+        # pending — completing it is a second call the user makes from the list.
+        await self._api.create_chores(
+            self._frame_id,
+            summary=item.summary or "Chore",
+            start=_chore_start(item.due),
+            category_ids=[self._category_id],
+            description=item.description,
         )
-        await self._api.update_chore_status(self._frame_id, item.uid, status)
+        await self.coordinator.async_request_refresh()
+
+    def _chore_attributes(self, uid: str) -> dict:
+        for c in self._member_chores():
+            if str(c.get("id")) == str(uid):
+                return c.get("attributes", {}) or {}
+        return {}
+
+    async def async_update_todo_item(self, item: TodoItem) -> None:
+        if not item.uid:
+            return
+
+        chore_id, occurrence = _split_chore_uid(item.uid)
+        attrs = self._chore_attributes(item.uid)
+
+        attributes: dict = {}
+        if item.summary is not None:
+            attributes["summary"] = item.summary
+        if item.due is not None:
+            attributes["start"] = _chore_start(item.due)
+        if item.description is not None:
+            attributes["description"] = item.description
+        if attributes:
+            await self._api.update_chore(self._frame_id, chore_id, attributes)
+
+        # Completion lives on its own sub-resource, so only touch it when the
+        # tick actually changed: HA re-sends the whole item on any edit, and
+        # clearing an already-incomplete chore isn't necessarily a no-op.
+        if item.status is not None:
+            want_complete = item.status == TodoItemStatus.COMPLETED
+            if want_complete != _chore_is_complete(attrs):
+                # Which occurrence is being ticked: the date in the uid, else
+                # the chore's own ``start`` day. An on-demand chore has neither
+                # and must send no date at all — see :meth:`complete_chore`.
+                instance_date = occurrence or (attrs.get("start") or "")[:10] or None
+                if want_complete:
+                    # The frame files completions by calendar day, so use HA's
+                    # local date rather than UTC.
+                    await self._api.complete_chore(
+                        self._frame_id,
+                        chore_id,
+                        dt_util.now().date().isoformat(),
+                        instance_date,
+                    )
+                else:
+                    await self._api.uncomplete_chore(
+                        self._frame_id, chore_id, instance_date
+                    )
+
+        await self.coordinator.async_request_refresh()
+
+    async def async_delete_todo_items(self, uids: list[str]) -> None:
+        for uid in uids:
+            await self._api.delete_chore(self._frame_id, _split_chore_uid(uid)[0])
         await self.coordinator.async_request_refresh()

@@ -2,32 +2,44 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Mapping
+from datetime import date
 import logging
 import mimetypes
 from pathlib import Path
+from typing import Any
 
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import config_validation as cv, device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.util import dt as dt_util
 
 from .api import SkylightAPI, SkylightAPIError
 from .const import (
     CONF_ACCESS_TOKEN,
+    CONF_CALENDAR_INTERVAL,
     CONF_DEVICE_FINGERPRINT,
     CONF_FRAME_ID,
+    CONF_FRAME_INTERVAL,
     CONF_FRAME_NAME,
+    CONF_LISTS_INTERVAL,
+    CONF_PHOTOS_INTERVAL,
     CONF_REFRESH_TOKEN,
+    CONF_SENSOR_INTERVAL,
     DOMAIN,
+    PLATFORM_BINARY_SENSOR,
     PLATFORM_CALENDAR,
     PLATFORM_IMAGE,
     PLATFORM_NUMBER,
     PLATFORM_SENSOR,
     PLATFORM_SWITCH,
+    PLATFORM_TIME,
     PLATFORM_TODO,
+    SCAN_INTERVAL_OPTIONS,
 )
 from .coordinator import (
     SkylightCalendarCoordinator,
@@ -46,6 +58,8 @@ PLATFORMS = [
     PLATFORM_IMAGE,
     PLATFORM_SWITCH,
     PLATFORM_NUMBER,
+    PLATFORM_TIME,
+    PLATFORM_BINARY_SENSOR,
 ]
 
 
@@ -84,11 +98,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         token_update_cb=_persist_tokens,
     )
 
-    calendar_coord = SkylightCalendarCoordinator(hass, api, frame_id)
-    lists_coord = SkylightListsCoordinator(hass, api, frame_id)
-    sensor_coord = SkylightSensorCoordinator(hass, api, frame_id)
-    frame_coord = SkylightFrameCoordinator(hass, api, frame_id)
-    photos_coord = SkylightPhotosCoordinator(hass, api, frame_id)
+    def _interval(key: str) -> int:
+        return int(entry.options.get(key, SCAN_INTERVAL_OPTIONS[key]))
+
+    calendar_coord = SkylightCalendarCoordinator(
+        hass, api, frame_id, _interval(CONF_CALENDAR_INTERVAL)
+    )
+    lists_coord = SkylightListsCoordinator(
+        hass, api, frame_id, _interval(CONF_LISTS_INTERVAL)
+    )
+    sensor_coord = SkylightSensorCoordinator(
+        hass, api, frame_id, _interval(CONF_SENSOR_INTERVAL)
+    )
+    frame_coord = SkylightFrameCoordinator(
+        hass, api, frame_id, _interval(CONF_FRAME_INTERVAL)
+    )
+    photos_coord = SkylightPhotosCoordinator(
+        hass, api, frame_id, _interval(CONF_PHOTOS_INTERVAL)
+    )
 
     await calendar_coord.async_config_entry_first_refresh()
     await lists_coord.async_config_entry_first_refresh()
@@ -122,10 +149,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _async_register_services(hass)
+    # Poll intervals are baked into the coordinators at construction, so a change
+    # only takes effect on reload.
+    entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
     return True
 
 
+async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload after the options flow saves."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
 SERVICE_UPLOAD_MEDIA = "upload_media"
+SERVICE_CREATE_CHORE = "create_chore"
+SERVICE_CREATE_TASK = "create_task"
+SERVICE_CREATE_LIST = "create_list"
+SERVICE_DELETE_LIST = "delete_list"
+SERVICE_CREATE_REWARD = "create_reward"
+SERVICE_REDEEM_REWARD = "redeem_reward"
+SERVICE_CREATE_RECIPE = "create_recipe"
+SERVICE_PLAN_MEAL = "plan_meal"
+SERVICE_ADD_RECIPE_TO_GROCERY_LIST = "add_recipe_to_grocery_list"
 
 _ALLOWED_EXTS = {
     # images
@@ -134,14 +178,307 @@ _ALLOWED_EXTS = {
     "mp4", "mov", "m4v",
 }
 
+# Every service accepts an optional frame_id; it's only required when more than
+# one frame is configured.
+_FRAME_ID_FIELD = {vol.Optional("frame_id"): vol.All(str, vol.Length(min=1))}
+_SUMMARY = vol.All(str, vol.Length(min=1))
+_POINTS = vol.All(vol.Coerce(int), vol.Range(min=0))
+
 
 UPLOAD_MEDIA_SCHEMA = vol.Schema(
     {
         vol.Required("file_path"): vol.All(str, vol.Length(min=1)),
         vol.Optional("caption", default=""): str,
-        vol.Optional("frame_id"): vol.All(str, vol.Length(min=1)),
+        **_FRAME_ID_FIELD,
     }
 )
+
+def _has_assignee(data: dict) -> dict:
+    """Skylight 422s a chore with no category, so don't let the call through."""
+    if not data.get("assignees") and not data.get("category_ids"):
+        raise vol.Invalid(
+            "A chore needs an assignee: pass assignees (family member names) "
+            "or category_ids (raw IDs)."
+        )
+    return data
+
+
+CREATE_CHORE_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            vol.Required("summary"): _SUMMARY,
+            # Either form works, and both accept one value or several — the
+            # route creates one chore per assignee.
+            vol.Optional("assignees"): vol.All(cv.ensure_list, [cv.string]),
+            vol.Optional("category_ids"): vol.All(cv.ensure_list, [cv.string]),
+            vol.Optional("start"): cv.date,
+            vol.Optional("start_time"): cv.string,
+            vol.Optional("description"): cv.string,
+            vol.Optional("routine", default=False): cv.boolean,
+            vol.Optional("up_for_grabs", default=False): cv.boolean,
+            vol.Optional("recurrence_set"): cv.string,
+            vol.Optional("recurring_until"): cv.date,
+            **_FRAME_ID_FIELD,
+        }
+    ),
+    _has_assignee,
+)
+
+CREATE_TASK_SCHEMA = vol.Schema(
+    {
+        vol.Required("summary"): _SUMMARY,
+        vol.Optional("emoji"): cv.string,
+        vol.Optional("reward_points"): _POINTS,
+        vol.Optional("routine", default=False): cv.boolean,
+        **_FRAME_ID_FIELD,
+    }
+)
+
+CREATE_LIST_SCHEMA = vol.Schema(
+    {
+        vol.Required("label"): _SUMMARY,
+        vol.Optional("kind", default="to_do"): vol.In(["to_do", "shopping"]),
+        vol.Optional("color"): cv.string,
+        **_FRAME_ID_FIELD,
+    }
+)
+
+DELETE_LIST_SCHEMA = vol.Schema(
+    {vol.Required("list_id"): cv.string, **_FRAME_ID_FIELD}
+)
+
+CREATE_REWARD_SCHEMA = vol.Schema(
+    {
+        vol.Required("name"): _SUMMARY,
+        vol.Required("point_value"): _POINTS,
+        vol.Optional("description"): cv.string,
+        vol.Optional("emoji"): cv.string,
+        vol.Optional("category_ids"): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional("respawn_on_redemption", default=False): cv.boolean,
+        **_FRAME_ID_FIELD,
+    }
+)
+
+REDEEM_REWARD_SCHEMA = vol.Schema(
+    {
+        vol.Required("reward_id"): cv.string,
+        vol.Optional("category_id"): cv.string,
+        **_FRAME_ID_FIELD,
+    }
+)
+
+CREATE_RECIPE_SCHEMA = vol.Schema(
+    {
+        vol.Required("summary"): _SUMMARY,
+        vol.Optional("description"): cv.string,
+        vol.Optional("meal_category_id"): cv.string,
+        **_FRAME_ID_FIELD,
+    }
+)
+
+PLAN_MEAL_SCHEMA = vol.Schema(
+    {
+        vol.Required("date"): cv.date,
+        vol.Required("meal_category_id"): cv.string,
+        vol.Optional("recipe_id"): cv.string,
+        **_FRAME_ID_FIELD,
+    }
+)
+
+ADD_RECIPE_TO_GROCERY_LIST_SCHEMA = vol.Schema(
+    {vol.Required("recipe_id"): cv.string, **_FRAME_ID_FIELD}
+)
+
+
+def _resolve_entry(hass: HomeAssistant, target_frame: str | None) -> dict:
+    """Pick the loaded config entry a service call targets."""
+    entries = hass.data.get(DOMAIN, {})
+    if not entries:
+        raise HomeAssistantError("No Skylight config entries loaded.")
+
+    if target_frame:
+        entry_data = next(
+            (v for v in entries.values() if str(v.get("frame_id")) == str(target_frame)),
+            None,
+        )
+        if entry_data is None:
+            raise HomeAssistantError(
+                f"No Skylight frame with id={target_frame} configured."
+            )
+        return entry_data
+
+    if len(entries) > 1:
+        raise HomeAssistantError(
+            "Multiple Skylight frames configured — pass frame_id to disambiguate."
+        )
+    return next(iter(entries.values()))
+
+
+# ── Service actions ─────────────────────────────────────────────────────
+# Each takes the resolved client + frame and the validated call data. The
+# dispatcher in _make_write_handler owns entry resolution, error translation and
+# the follow-up coordinator refresh, so these stay one call each.
+
+ServiceAction = Callable[[SkylightAPI, str, Mapping[str, Any]], Awaitable[None]]
+
+
+async def _resolve_assignees(
+    api: SkylightAPI, frame_id: str, names: list[str]
+) -> list[str]:
+    """Map family member names onto category IDs.
+
+    Only categories with ``linked_to_profile`` are candidates. A frame's
+    category list also holds calendar buckets ("US Holidays", "Garbage Pickup")
+    and near-miss names — "Robbie" and "Robbie's Calendar" both exist on a real
+    frame — and assigning a chore to one of those is silently wrong rather than
+    an error, so they're excluded outright. Exact matches beat substring ones
+    for the same reason.
+    """
+    people: list[tuple[str, str]] = [
+        (str(c.get("id")), (c.get("attributes") or {}).get("label") or "")
+        for c in (await api.get_categories(frame_id)).get("data", []) or []
+        if (c.get("attributes") or {}).get("linked_to_profile")
+    ]
+
+    resolved: list[str] = []
+    unknown: list[str] = []
+    for name in names:
+        wanted = name.strip().lower()
+        exact = next((cid for cid, label in people if label.lower() == wanted), None)
+        partial = next((cid for cid, label in people if wanted in label.lower()), None)
+        if match := (exact or partial):
+            resolved.append(match)
+        else:
+            unknown.append(name)
+
+    if unknown:
+        known = ", ".join(sorted(label for _, label in people if label)) or "none"
+        raise HomeAssistantError(
+            f"Unknown Skylight family member(s): {', '.join(unknown)}. "
+            f"Known members on this frame: {known}."
+        )
+    return resolved
+
+
+async def _create_chore(api: SkylightAPI, frame_id: str, data: Mapping[str, Any]) -> None:
+    start: date | None = data.get("start")
+    until: date | None = data.get("recurring_until")
+    category_ids = list(data.get("category_ids") or [])
+    if names := data.get("assignees"):
+        category_ids += await _resolve_assignees(api, frame_id, names)
+    await api.create_chores(
+        frame_id,
+        summary=data["summary"],
+        start=(start or dt_util.now().date()).isoformat(),
+        category_ids=category_ids,
+        description=data.get("description"),
+        start_time=data.get("start_time"),
+        routine=data["routine"],
+        up_for_grabs=data["up_for_grabs"],
+        recurrence_set=data.get("recurrence_set"),
+        recurring_until=until.isoformat() if until else None,
+    )
+
+
+async def _create_task(api: SkylightAPI, frame_id: str, data: Mapping[str, Any]) -> None:
+    await api.create_task_box_item(
+        frame_id,
+        summary=data["summary"],
+        emoji_icon=data.get("emoji"),
+        routine=data["routine"],
+        reward_points=data.get("reward_points"),
+    )
+
+
+async def _create_list(api: SkylightAPI, frame_id: str, data: Mapping[str, Any]) -> None:
+    await api.create_list(
+        frame_id, label=data["label"], kind=data["kind"], color=data.get("color")
+    )
+
+
+async def _delete_list(api: SkylightAPI, frame_id: str, data: Mapping[str, Any]) -> None:
+    await api.delete_list(frame_id, data["list_id"])
+
+
+async def _create_reward(api: SkylightAPI, frame_id: str, data: Mapping[str, Any]) -> None:
+    await api.create_reward(
+        frame_id,
+        name=data["name"],
+        point_value=data["point_value"],
+        description=data.get("description"),
+        emoji_icon=data.get("emoji"),
+        category_ids=data.get("category_ids"),
+        respawn_on_redemption=data["respawn_on_redemption"],
+    )
+
+
+async def _redeem_reward(api: SkylightAPI, frame_id: str, data: Mapping[str, Any]) -> None:
+    await api.redeem_reward(frame_id, data["reward_id"], data.get("category_id"))
+
+
+async def _create_recipe(api: SkylightAPI, frame_id: str, data: Mapping[str, Any]) -> None:
+    await api.create_recipe(
+        frame_id,
+        summary=data["summary"],
+        description=data.get("description"),
+        meal_category_id=data.get("meal_category_id"),
+    )
+
+
+async def _plan_meal(api: SkylightAPI, frame_id: str, data: Mapping[str, Any]) -> None:
+    await api.create_meal_sitting(
+        frame_id,
+        date=data["date"].isoformat(),
+        meal_category_id=data["meal_category_id"],
+        recipe_id=data.get("recipe_id"),
+    )
+
+
+async def _add_recipe_to_grocery(
+    api: SkylightAPI, frame_id: str, data: Mapping[str, Any]
+) -> None:
+    await api.add_recipe_to_grocery_list(frame_id, data["recipe_id"])
+
+
+# (service name, schema, coordinator to refresh afterwards, action)
+_WRITE_SERVICES: tuple[tuple[str, vol.Schema, str, ServiceAction], ...] = (
+    (SERVICE_CREATE_CHORE, CREATE_CHORE_SCHEMA, "sensor_coordinator", _create_chore),
+    (SERVICE_CREATE_TASK, CREATE_TASK_SCHEMA, "sensor_coordinator", _create_task),
+    (SERVICE_CREATE_LIST, CREATE_LIST_SCHEMA, "lists_coordinator", _create_list),
+    (SERVICE_DELETE_LIST, DELETE_LIST_SCHEMA, "lists_coordinator", _delete_list),
+    (SERVICE_CREATE_REWARD, CREATE_REWARD_SCHEMA, "sensor_coordinator", _create_reward),
+    (SERVICE_REDEEM_REWARD, REDEEM_REWARD_SCHEMA, "sensor_coordinator", _redeem_reward),
+    (SERVICE_CREATE_RECIPE, CREATE_RECIPE_SCHEMA, "sensor_coordinator", _create_recipe),
+    (SERVICE_PLAN_MEAL, PLAN_MEAL_SCHEMA, "sensor_coordinator", _plan_meal),
+    (
+        SERVICE_ADD_RECIPE_TO_GROCERY_LIST,
+        ADD_RECIPE_TO_GROCERY_LIST_SCHEMA,
+        "lists_coordinator",
+        _add_recipe_to_grocery,
+    ),
+)
+
+_ALL_SERVICES = (SERVICE_UPLOAD_MEDIA, *(name for name, *_ in _WRITE_SERVICES))
+
+
+def _make_write_handler(
+    hass: HomeAssistant, coordinator_key: str, action: ServiceAction
+):
+    """Wrap a service action with entry resolution, error mapping and a refresh."""
+
+    async def _handler(call: ServiceCall) -> None:
+        entry_data = _resolve_entry(hass, call.data.get("frame_id"))
+        try:
+            await action(entry_data["api"], entry_data["frame_id"], call.data)
+        except SkylightAPIError as err:
+            raise HomeAssistantError(
+                f"Skylight rejected {DOMAIN}.{call.service}: {err}"
+            ) from err
+        coordinator = entry_data.get(coordinator_key)
+        if coordinator is not None:
+            await coordinator.async_request_refresh()
+
+    return _handler
 
 
 def _async_register_services(hass: HomeAssistant) -> None:
@@ -152,29 +489,8 @@ def _async_register_services(hass: HomeAssistant) -> None:
     async def _handle_upload_media(call: ServiceCall) -> None:
         file_path = call.data["file_path"]
         caption = call.data.get("caption", "") or ""
-        target_frame = call.data.get("frame_id")
 
-        entries = hass.data.get(DOMAIN, {})
-        if not entries:
-            raise HomeAssistantError("No Skylight config entries loaded.")
-
-        # Pick a target entry
-        if target_frame:
-            entry_data = next(
-                (v for v in entries.values() if str(v.get("frame_id")) == str(target_frame)),
-                None,
-            )
-            if entry_data is None:
-                raise HomeAssistantError(
-                    f"No Skylight frame with id={target_frame} configured."
-                )
-        elif len(entries) == 1:
-            entry_data = next(iter(entries.values()))
-        else:
-            raise HomeAssistantError(
-                "Multiple Skylight frames configured — pass frame_id to disambiguate."
-            )
-
+        entry_data = _resolve_entry(hass, call.data.get("frame_id"))
         api: SkylightAPI = entry_data["api"]
         frame_id: str = entry_data["frame_id"]
 
@@ -236,15 +552,23 @@ def _async_register_services(hass: HomeAssistant) -> None:
         DOMAIN, SERVICE_UPLOAD_MEDIA, _handle_upload_media, schema=UPLOAD_MEDIA_SCHEMA
     )
 
+    for name, schema, coordinator_key, action in _WRITE_SERVICES:
+        hass.services.async_register(
+            DOMAIN,
+            name,
+            _make_write_handler(hass, coordinator_key, action),
+            schema=schema,
+        )
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id, None)
-        # Remove the shared service when the last entry unloads.
-        if not hass.data.get(DOMAIN) and hass.services.has_service(
-            DOMAIN, SERVICE_UPLOAD_MEDIA
-        ):
-            hass.services.async_remove(DOMAIN, SERVICE_UPLOAD_MEDIA)
+        # Remove the shared services when the last entry unloads.
+        if not hass.data.get(DOMAIN):
+            for name in _ALL_SERVICES:
+                if hass.services.has_service(DOMAIN, name):
+                    hass.services.async_remove(DOMAIN, name)
     return unload_ok

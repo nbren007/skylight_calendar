@@ -10,7 +10,15 @@ from typing import Any
 import aiohttp
 from yarl import URL
 
-from .const import API_VERSION, BASE_URL, CLIENT_ID, OAUTH_URL, USER_AGENT
+from .const import (
+    API_VERSION,
+    BASE_URL,
+    CHORE_STATUS_COMPLETE,
+    CHORE_STATUS_PENDING,
+    CLIENT_ID,
+    OAUTH_URL,
+    USER_AGENT,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -129,6 +137,26 @@ class SkylightAPIError(Exception):
     """Raised on non-401 HTTP failures."""
 
 
+def _compact(**fields: Any) -> dict:
+    """Drop ``None`` fields — used where the API rejects explicit nulls."""
+    return {k: v for k, v in fields.items() if v is not None}
+
+
+def _jsonapi_doc(resource_type: str, attributes: Mapping[str, Any]) -> dict:
+    """Wrap attributes in a JSON:API request document.
+
+    UNVERIFIED. Every remaining caller (create/update list, create task_box
+    item, update chore) came from the skylight-mcp reference, which has no
+    fixtures for any of them. Two endpoints ported from that reference — chore
+    create and reward create — both turned out to want flat bodies instead, so
+    treat this envelope as suspect until a capture confirms it per-endpoint.
+
+    Confirmed flat: chore create, calendar events, recipes, meal sittings, list
+    items, device PATCH. Inferred flat: reward create/update.
+    """
+    return {"data": {"type": resource_type, "attributes": dict(attributes)}}
+
+
 class SkylightAPI:
     """Async Skylight API client."""
 
@@ -145,6 +173,10 @@ class SkylightAPI:
         self._refresh_token = refresh_token
         self._device_fingerprint = device_fingerprint or ""
         self._token_update_cb = token_update_cb
+        # GET url -> (etag, raw body), for the handful of getters marked
+        # cacheable=True. The raw text is stored rather than the parsed object so
+        # a caller can never mutate another poll's data.
+        self._etags: dict[str, tuple[str, str]] = {}
 
     @property
     def access_token(self) -> str:
@@ -161,6 +193,7 @@ class SkylightAPI:
         *,
         params: Mapping[str, Any] | None = None,
         json_body: Any | None = None,
+        cacheable: bool = False,
         _retry: bool = True,
     ) -> Any:
         url = URL(f"{BASE_URL}{path}")
@@ -177,6 +210,20 @@ class SkylightAPI:
         if params:
             clean_params = {k: v for k, v in params.items() if v is not None}
 
+        # Opt-in per endpoint, and only for GETs.
+        #
+        # Caching defaults OFF because a stale 304 is indistinguishable from
+        # "nothing changed": if Skylight's validator doesn't move when the
+        # underlying record does, the change never reaches HA. The web app draws
+        # exactly this line — it sends If-None-Match on frames, categories,
+        # devices, source_calendars, user and avatars, and pointedly does NOT on
+        # chores or rewards. Only mark a getter cacheable with that evidence.
+        cache_key: str | None = None
+        if cacheable and method == "GET":
+            cache_key = str(url.with_query(clean_params or {}))
+            if cached := self._etags.get(cache_key):
+                headers["If-None-Match"] = cached[0]
+
         async with self._session.request(
             method,
             url,
@@ -185,18 +232,55 @@ class SkylightAPI:
             json=json_body,
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
+            if resp.status == 304 and cache_key is not None:
+                cached = self._etags.get(cache_key)
+                if cached is not None:
+                    return _json.loads(cached[1]) if cached[1] else {}
+                # Server said "unchanged" but we have nothing to show for it;
+                # drop the validator and let the caller retry cleanly.
+                _LOGGER.debug("Skylight 304 on %s with no cached body", path)
+                raise SkylightAPIError(f"GET {path} → 304 without a cached body")
             if resp.status == 401 and _retry:
                 _LOGGER.debug("Skylight 401 on %s — refreshing token", path)
                 await self._refresh_access_token()
                 return await self._request(
-                    method, path, params=params, json_body=json_body, _retry=False
+                    method,
+                    path,
+                    params=params,
+                    json_body=json_body,
+                    cacheable=cacheable,
+                    _retry=False,
                 )
             if resp.status == 401:
                 raise SkylightAuthError("Skylight auth failed after refresh")
             if resp.status >= 400:
                 text = await resp.text()
-                raise SkylightAPIError(f"{method} {path} → {resp.status}: {text[:200]}")
+                # Echo the payload back on validation failures. Skylight's 4xx
+                # bodies name the offending field but never what we sent, and
+                # that's the only thing separating a wrong key name from a wrong
+                # envelope — without it every fix is a guess.
+                _LOGGER.debug(
+                    "Skylight %s %s rejected (%s): sent=%s got=%s",
+                    method,
+                    path,
+                    resp.status,
+                    _json.dumps(json_body) if json_body is not None else "<no body>",
+                    text[:500],
+                )
+                detail = ""
+                if resp.status == 422 and json_body is not None:
+                    detail = f" — sent {_json.dumps(json_body)}"
+                raise SkylightAPIError(
+                    f"{method} {path} → {resp.status}: {text[:200]}{detail}"
+                )
             text = await resp.text()
+            if cache_key is not None and (etag := resp.headers.get("ETag")):
+                # Bound the cache: calendar/chore windows shift daily, so keys
+                # accumulate slowly. Clearing wholesale is fine — worst case is
+                # one uncached poll per endpoint.
+                if len(self._etags) >= 64:
+                    self._etags.clear()
+                self._etags[cache_key] = (etag, text)
             if not text:
                 return {}
             return _json.loads(text)
@@ -253,17 +337,24 @@ class SkylightAPI:
     # ── Endpoints ───────────────────────────────────────────────────────
 
     async def get_frames(self) -> list[dict]:
-        data = await self._request("GET", "/api/frames")
+        """Frames on the account, as ``{id, name}`` for the config flow.
+
+        ``attributes.name`` is a generated slug ("byrd-malone-7772"), so prefer
+        ``household_name`` ("Byrd & Malone") — that's what the app displays and
+        what a user will recognise in the frame picker.
+        """
+        data = await self._request("GET", "/api/frames", cacheable=True)
         out = []
         for item in data.get("data", []):
             fid = item.get("id")
-            name = item.get("attributes", {}).get("name")
+            attrs = item.get("attributes", {}) or {}
+            name = attrs.get("household_name") or attrs.get("name")
             if fid:
                 out.append({"id": str(fid), "name": name or f"Skylight Frame {fid}"})
         return out
 
     async def get_frame(self, frame_id: str) -> dict:
-        return await self._request("GET", f"/api/frames/{frame_id}")
+        return await self._request("GET", f"/api/frames/{frame_id}", cacheable=True)
 
     async def get_devices(self, frame_id: str) -> list[dict]:
         """List devices attached to a frame.
@@ -274,7 +365,9 @@ class SkylightAPI:
         `/api/frames/{fid}/devices/{did}`. Returns each device as a dict with
         {id, attributes}.
         """
-        resp = await self._request("GET", f"/api/frames/{frame_id}/devices")
+        resp = await self._request(
+            "GET", f"/api/frames/{frame_id}/devices", cacheable=True
+        )
         return [
             {"id": str(d.get("id")), "attributes": d.get("attributes", {}) or {}}
             for d in resp.get("data", [])
@@ -305,18 +398,104 @@ class SkylightAPI:
             params={"date_min": date_min, "date_max": date_max, "timezone": timezone},
         )
 
+    async def create_calendar_event(
+        self,
+        frame_id: str,
+        summary: str,
+        starts_at: str,
+        ends_at: str,
+        *,
+        all_day: bool = False,
+        description: str | None = None,
+        location: str | None = None,
+        category_ids: list[str] | None = None,
+        calendar_account_id: str | None = None,
+        calendar_id: str | None = None,
+        rrule: list[str] | None = None,
+        timezone: str = "UTC",
+        kind: str = "standard",
+    ) -> dict:
+        """Create a calendar event (plain-JSON body, no JSON:API envelope).
+
+        ``calendar_account_id`` / ``calendar_id`` target a specific connected
+        source calendar; omit both to land the event on the frame's own Skylight
+        calendar. ``category_ids`` assigns the event to family members.
+        """
+        body: dict[str, Any] = {
+            "summary": summary,
+            "starts_at": starts_at,
+            "ends_at": ends_at,
+            "all_day": all_day,
+            "timezone": timezone,
+            "kind": kind,
+            **_compact(
+                description=description,
+                location=location,
+                category_ids=category_ids,
+                calendar_account_id=calendar_account_id,
+                calendar_id=calendar_id,
+                rrule=rrule,
+            ),
+        }
+        return await self._request(
+            "POST", f"/api/frames/{frame_id}/calendar_events", json_body=body
+        )
+
+    async def update_calendar_event(
+        self, frame_id: str, event_id: str, attributes: dict
+    ) -> dict:
+        """Partial update of a calendar event (plain-JSON PUT body).
+
+        Only the keys present in ``attributes`` change. Use wire names:
+        ``summary``, ``starts_at``, ``ends_at``, ``all_day``, ``description``,
+        ``location``, ``category_ids``, ``rrule``, ``timezone``.
+        """
+        return await self._request(
+            "PUT",
+            f"/api/frames/{frame_id}/calendar_events/{event_id}",
+            json_body=attributes,
+        )
+
+    async def delete_calendar_event(self, frame_id: str, event_id: str) -> None:
+        await self._request(
+            "DELETE", f"/api/frames/{frame_id}/calendar_events/{event_id}"
+        )
+
     async def get_source_calendars(self, frame_id: str) -> dict:
-        return await self._request("GET", f"/api/frames/{frame_id}/source_calendars")
+        return await self._request(
+            "GET", f"/api/frames/{frame_id}/source_calendars", cacheable=True
+        )
 
     async def get_categories(self, frame_id: str, include_profiles: bool = True) -> dict:
         return await self._request(
             "GET",
             f"/api/frames/{frame_id}/categories",
             params={"include_profiles": "true" if include_profiles else None},
+            cacheable=True,
         )
 
     async def get_lists(self, frame_id: str) -> dict:
         return await self._request("GET", f"/api/frames/{frame_id}/lists")
+
+    async def create_list(
+        self, frame_id: str, label: str, kind: str = "to_do", color: str | None = None
+    ) -> dict:
+        """Create a list (JSON:API POST). ``kind`` is ``shopping`` or ``to_do``."""
+        doc = _jsonapi_doc("list", {"label": label, "kind": kind, "color": color})
+        return await self._request(
+            "POST", f"/api/frames/{frame_id}/lists", json_body=doc
+        )
+
+    async def update_list(self, frame_id: str, list_id: str, attributes: dict) -> dict:
+        """Partial update of a list (JSON:API PUT) — ``label``, ``kind``, ``color``."""
+        return await self._request(
+            "PUT",
+            f"/api/frames/{frame_id}/lists/{list_id}",
+            json_body=_jsonapi_doc("list", attributes),
+        )
+
+    async def delete_list(self, frame_id: str, list_id: str) -> None:
+        await self._request("DELETE", f"/api/frames/{frame_id}/lists/{list_id}")
 
     async def get_list_items(self, frame_id: str, list_id: str) -> dict:
         return await self._request(
@@ -346,35 +525,168 @@ class SkylightAPI:
             "DELETE", f"/api/frames/{frame_id}/lists/{list_id}/list_items/{item_id}"
         )
 
-    async def get_chores(self, frame_id: str, after: str, before: str) -> dict:
+    async def get_chores(
+        self,
+        frame_id: str,
+        after: str,
+        before: str,
+        *,
+        filter_linked_to_profile: bool = False,
+    ) -> dict:
+        """Chores in a date range. Set ``filter_linked_to_profile`` to drop chores
+        that aren't assigned to a real family member profile.
+
+        ``include_up_for_grabs`` mirrors the web app, which always asks for
+        unclaimed chores; without it they're missing from the feed entirely.
+        """
         return await self._request(
             "GET",
             f"/api/frames/{frame_id}/chores",
-            params={"after": after, "before": before, "include_late": "true"},
+            params={
+                "after": after,
+                "before": before,
+                "include_late": "true",
+                "include_up_for_grabs": "true",
+                "filter": "linked_to_profile" if filter_linked_to_profile else None,
+            },
         )
 
-    async def complete_chore(self, frame_id: str, chore_id: str) -> dict:
-        """Mark a chore complete (JSON:API PUT)."""
-        body = {
-            "data": {
-                "type": "chore",
-                "id": chore_id,
-                "attributes": {"status": "completed"},
-            }
-        }
-        return await self._request(
-            "PUT", f"/api/frames/{frame_id}/chores/{chore_id}", json_body=body
-        )
-
-    async def update_chore_status(
-        self, frame_id: str, chore_id: str, status: str
+    async def create_chores(
+        self,
+        frame_id: str,
+        summary: str,
+        start: str,
+        category_ids: list[str],
+        *,
+        description: str | None = None,
+        start_time: str | None = None,
+        routine: bool = False,
+        up_for_grabs: bool = False,
+        recurrence_set: str | None = None,
+        recurring_until: str | None = None,
+        renewal_interval: int | None = None,
+        renewal_unit: str | None = None,
     ) -> dict:
+        """Create a chore for each of ``category_ids``.
+
+        Skylight has no singular chore-create route: the only one is
+        ``chores/create_multiple``, which fans out one chore per assigned family
+        member. ``POST /chores`` exists but answers ``422 Category is required``
+        no matter how the category is passed.
+
+        Wire shape captured from the Skylight web app. It is a flat body — *not*
+        the JSON:API envelope the rest of the chore routes use — and every key is
+        sent, nulls included. Don't add unobserved keys here: ``status``,
+        ``reward_points`` and ``emoji_icon`` are deliberately absent because the
+        app never sends them on create, and this payload is known-good as-is.
+        """
         body = {
-            "data": {"type": "chore", "id": chore_id, "attributes": {"status": status}}
+            "start": start,
+            "up_for_grabs": up_for_grabs,
+            "routine": routine,
+            "start_time": start_time,
+            "recurrence_set": recurrence_set,
+            "renewal_interval": renewal_interval,
+            "renewal_unit": renewal_unit,
+            "recurring_until": recurring_until,
+            "summary": summary,
+            "description": description,
+            "category_ids": [str(c) for c in category_ids],
         }
         return await self._request(
-            "PUT", f"/api/frames/{frame_id}/chores/{chore_id}", json_body=body
+            "POST", f"/api/frames/{frame_id}/chores/create_multiple", json_body=body
         )
+
+    async def update_chore(
+        self,
+        frame_id: str,
+        chore_id: str,
+        attributes: dict,
+    ) -> dict:
+        """Partial edit of a chore's own fields (``summary``, ``start``, …).
+
+        Cannot change completion — that's a separate sub-resource, see
+        :meth:`complete_chore`.
+
+        INFERRED body: flat, matching the confirmed shapes of both
+        :meth:`create_chores` and :meth:`complete_chore`. The route itself hasn't
+        been captured; a 4xx here echoes the payload so it can be corrected.
+        """
+        return await self._request(
+            "PUT",
+            f"/api/frames/{frame_id}/chores/{chore_id}",
+            json_body=dict(attributes),
+        )
+
+    async def complete_chore(
+        self,
+        frame_id: str,
+        chore_id: str,
+        completed_on: str,
+        instance_date: str | None = None,
+    ) -> dict:
+        """Tick a chore off, crediting its reward points.
+
+        Confirmed against the web app. Three things here are not what you'd
+        guess: it's a dedicated ``completions`` sub-resource rather than a field
+        on the chore, the body is flat, and the status literal is ``complete``
+        rather than ``completed``.
+
+        ``chore_id`` is the *series* id — the bare number, never the composite
+        ``<series>-<date>`` id a recurring occurrence is listed under.
+
+        The two dates (``YYYY-MM-DD``) are separate values and routinely differ:
+        ``instance_date`` picks *which occurrence* is being ticked, while
+        ``completed_on`` records *when* it was ticked. Neither is defaulted from
+        the clock here — only the caller knows the right local date, and
+        deriving one from UTC would file a late-evening completion under
+        tomorrow.
+
+        ``instance_date`` is conditional, not merely optional. A chore that has
+        a ``start`` day *must* name its occurrence or the endpoint answers
+        ``422 instance_date can't be blank``. An on-demand chore (``start:
+        null`` — the renewal-interval kind) has no occurrence to name, and must
+        omit the key: the frame then materialises one on the day of completion,
+        and the response comes back under a freshly composite id.
+
+        The response's ``meta.reward_points`` and ``meta.milestones_achieved``
+        report what the completion earned.
+        """
+        return await self._request(
+            "PUT",
+            f"/api/frames/{frame_id}/chores/{chore_id}/completions",
+            json_body=_compact(
+                status=CHORE_STATUS_COMPLETE,
+                instance_date=instance_date,
+                completed_on=completed_on,
+            ),
+        )
+
+    async def uncomplete_chore(
+        self, frame_id: str, chore_id: str, instance_date: str | None = None
+    ) -> dict:
+        """Un-tick a chore.
+
+        The *same* PUT on the same sub-resource as :meth:`complete_chore`, just
+        ``pending`` and with no ``completed_on`` — there is nothing to record a
+        date for. Not a DELETE: the collection name reads like one, but the
+        endpoint sets a state rather than removing a record. The response clears
+        ``completed_on``, ``completed_at`` and ``completed_category``.
+
+        ``instance_date`` follows the same conditional rule as completing, and
+        an on-demand chore acquires one *by being completed* — so un-ticking it
+        does pass the date that completing it created.
+        """
+        return await self._request(
+            "PUT",
+            f"/api/frames/{frame_id}/chores/{chore_id}/completions",
+            json_body=_compact(
+                status=CHORE_STATUS_PENDING, instance_date=instance_date
+            ),
+        )
+
+    async def delete_chore(self, frame_id: str, chore_id: str) -> None:
+        await self._request("DELETE", f"/api/frames/{frame_id}/chores/{chore_id}")
 
     async def get_meals(self, frame_id: str, date_min: str, date_max: str) -> dict:
         return await self._request(
@@ -387,11 +699,131 @@ class SkylightAPI:
             },
         )
 
+    async def get_meal_categories(self, frame_id: str) -> dict:
+        """Meal slots for the frame (Breakfast, Lunch, Dinner, Snack)."""
+        return await self._request("GET", f"/api/frames/{frame_id}/meals/categories")
+
+    async def create_meal_sitting(
+        self,
+        frame_id: str,
+        date: str,
+        meal_category_id: str,
+        recipe_id: str | None = None,
+    ) -> dict:
+        """Schedule a meal into a slot on a date (plain-JSON body).
+
+        Omit ``recipe_id`` to block out the slot without picking a recipe.
+        """
+        body = {
+            "date": date,
+            "meal_category_id": meal_category_id,
+            **_compact(meal_recipe_id=recipe_id),
+        }
+        return await self._request(
+            "POST", f"/api/frames/{frame_id}/meals/sittings", json_body=body
+        )
+
     async def get_reward_points(self, frame_id: str) -> dict:
         return await self._request("GET", f"/api/frames/{frame_id}/reward_points")
 
-    async def get_rewards(self, frame_id: str) -> dict:
-        return await self._request("GET", f"/api/frames/{frame_id}/rewards")
+    async def get_rewards(
+        self,
+        frame_id: str,
+        redeemed_at_min: str | None = None,
+        redeemed_at_max: str | None = None,
+    ) -> dict:
+        """Redeemable rewards, one record per family member per reward.
+
+        The window bounds also pull in already-redeemed rewards; the web app
+        passes a rolling 30 days of both. Each reward carries a *to-one*
+        ``category`` relationship — a reward belongs to exactly one member, and
+        Skylight duplicates it across members rather than sharing one record.
+        """
+        return await self._request(
+            "GET",
+            f"/api/frames/{frame_id}/rewards",
+            params={
+                "redeemed_at_min": redeemed_at_min,
+                "redeemed_at_max": redeemed_at_max,
+            },
+        )
+
+    async def create_reward(
+        self,
+        frame_id: str,
+        name: str,
+        point_value: int,
+        *,
+        description: str | None = None,
+        emoji_icon: str | None = None,
+        category_ids: list[str] | None = None,
+        respawn_on_redemption: bool = False,
+    ) -> dict:
+        """Create a reward for each of ``category_ids``.
+
+        INFERRED wire shape, not captured. A GET shows every reward carrying a
+        *to-one* ``category`` and the same reward duplicated once per member
+        ("High Five" exists separately for each child) — the same fan-out
+        :meth:`create_chores` does. So this mirrors the one chore-create shape
+        that is confirmed: flat body, no JSON:API envelope, ``category_ids`` as
+        an array. The ported ``categories`` to-many relationship it replaces was
+        wrong on both key and cardinality.
+
+        If this 422s, the response now echoes the payload we sent — capture the
+        web app creating a reward and correct from that rather than guessing.
+        """
+        body = {
+            "name": name,
+            "point_value": point_value,
+            "description": description,
+            "emoji_icon": emoji_icon,
+            "respawn_on_redemption": respawn_on_redemption,
+            "category_ids": [str(c) for c in category_ids or []],
+        }
+        return await self._request(
+            "POST", f"/api/frames/{frame_id}/rewards", json_body=body
+        )
+
+    async def update_reward(
+        self,
+        frame_id: str,
+        reward_id: str,
+        attributes: dict,
+        *,
+        category_ids: list[str] | None = None,
+    ) -> dict:
+        """Partial update of a reward (plain-JSON PATCH).
+
+        Only the keys in ``attributes`` change. Flat body for the same reason as
+        :meth:`create_reward` — also inferred rather than captured.
+        """
+        body = dict(attributes)
+        if category_ids is not None:
+            body["category_ids"] = [str(c) for c in category_ids]
+        return await self._request(
+            "PATCH", f"/api/frames/{frame_id}/rewards/{reward_id}", json_body=body
+        )
+
+    async def delete_reward(self, frame_id: str, reward_id: str) -> None:
+        await self._request("DELETE", f"/api/frames/{frame_id}/rewards/{reward_id}")
+
+    async def redeem_reward(
+        self, frame_id: str, reward_id: str, category_id: str | None = None
+    ) -> dict:
+        """Spend points on a reward. ``category_id`` is the redeeming member."""
+        return await self._request(
+            "POST",
+            f"/api/frames/{frame_id}/rewards/{reward_id}/redeem",
+            json_body=_compact(category_id=category_id),
+        )
+
+    async def unredeem_reward(self, frame_id: str, reward_id: str) -> dict:
+        """Cancel a redemption and refund the points."""
+        return await self._request(
+            "POST",
+            f"/api/frames/{frame_id}/rewards/{reward_id}/unredeem",
+            json_body={},
+        )
 
     async def get_task_box(self, frame_id: str) -> dict:
         """Reusable chore-template items (the frame's 'Task Box').
@@ -401,10 +833,97 @@ class SkylightAPI:
         """
         return await self._request("GET", f"/api/frames/{frame_id}/task_box/items")
 
+    async def create_task_box_item(
+        self,
+        frame_id: str,
+        summary: str,
+        *,
+        emoji_icon: str | None = None,
+        routine: bool = False,
+        reward_points: int | None = None,
+    ) -> dict:
+        """Add an unscheduled item to the frame's Task Box (JSON:API POST).
+
+        Task box items carry no date — the frame assigns them to a day later.
+        """
+        doc = _jsonapi_doc(
+            "task_box_item",
+            {
+                "summary": summary,
+                "emoji_icon": emoji_icon,
+                "routine": routine,
+                "reward_points": reward_points,
+            },
+        )
+        return await self._request(
+            "POST", f"/api/frames/{frame_id}/task_box/items", json_body=doc
+        )
+
+    async def get_recipes(self, frame_id: str, include: str = "meal_category") -> dict:
+        return await self._request(
+            "GET",
+            f"/api/frames/{frame_id}/meals/recipes",
+            params={"include": include},
+        )
+
     async def get_recipe(self, frame_id: str, recipe_id: str) -> dict:
         return await self._request(
             "GET", f"/api/frames/{frame_id}/meals/recipes/{recipe_id}"
         )
+
+    async def create_recipe(
+        self,
+        frame_id: str,
+        summary: str,
+        *,
+        description: str | None = None,
+        meal_category_id: str | None = None,
+    ) -> dict:
+        """Create a recipe (plain-JSON body, no JSON:API envelope)."""
+        body = {
+            "summary": summary,
+            "description": description,
+            **_compact(meal_category_id=meal_category_id),
+        }
+        return await self._request(
+            "POST", f"/api/frames/{frame_id}/meals/recipes", json_body=body
+        )
+
+    async def update_recipe(
+        self, frame_id: str, recipe_id: str, attributes: dict
+    ) -> dict:
+        """Partial update of a recipe (plain-JSON PATCH) — ``summary``,
+        ``description``, ``meal_category_id``."""
+        return await self._request(
+            "PATCH",
+            f"/api/frames/{frame_id}/meals/recipes/{recipe_id}",
+            json_body=attributes,
+        )
+
+    async def delete_recipe(self, frame_id: str, recipe_id: str) -> None:
+        await self._request(
+            "DELETE", f"/api/frames/{frame_id}/meals/recipes/{recipe_id}"
+        )
+
+    async def add_recipe_to_grocery_list(self, frame_id: str, recipe_id: str) -> dict:
+        """Push a recipe's ingredients onto the frame's default grocery list."""
+        return await self._request(
+            "POST",
+            f"/api/frames/{frame_id}/meals/recipes/{recipe_id}/add_to_grocery_list",
+            json_body={},
+        )
+
+    async def get_albums(self, frame_id: str) -> dict:
+        """Photo albums configured on the frame."""
+        return await self._request("GET", f"/api/frames/{frame_id}/albums")
+
+    async def get_avatars(self) -> dict:
+        """Account-wide avatar options (used on family member profiles)."""
+        return await self._request("GET", "/api/avatars", cacheable=True)
+
+    async def get_colors(self) -> dict:
+        """Account-wide colour palette (used on categories and lists)."""
+        return await self._request("GET", "/api/colors", cacheable=True)
 
     async def get_cloud_upload_credentials(self) -> dict:
         """Fetch short-lived S3 credentials for uploading media."""

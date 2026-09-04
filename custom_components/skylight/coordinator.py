@@ -25,12 +25,18 @@ _LOGGER = logging.getLogger(__name__)
 class SkylightCalendarCoordinator(DataUpdateCoordinator):
     """Fetch calendar events + source_calendars for splitting into per-calendar entities."""
 
-    def __init__(self, hass: HomeAssistant, api: SkylightAPI, frame_id: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: SkylightAPI,
+        frame_id: str,
+        update_interval: int = CALENDAR_SCAN_INTERVAL,
+    ) -> None:
         super().__init__(
             hass,
             _LOGGER,
             name=f"{DOMAIN} calendar {frame_id}",
-            update_interval=timedelta(seconds=CALENDAR_SCAN_INTERVAL),
+            update_interval=timedelta(seconds=update_interval),
         )
         self.api = api
         self.frame_id = frame_id
@@ -53,14 +59,31 @@ class SkylightCalendarCoordinator(DataUpdateCoordinator):
         source_calendars: list[dict] = []
         try:
             sc_resp = await self.api.get_source_calendars(self.frame_id)
+            # `included` carries the calendar_account records holding the real
+            # account email. `source_id` is NOT an email for caldav/webcal feeds
+            # — it's the full collection URL — so the two are tracked separately.
+            accounts = {
+                str(inc.get("id")): (inc.get("attributes", {}) or {}).get("email")
+                for inc in sc_resp.get("included", []) or []
+                if inc.get("type") == "calendar_account"
+            }
             for entry in sc_resp.get("data", []):
                 a = entry.get("attributes", {})
+                account = (
+                    ((entry.get("relationships", {}) or {}).get("calendar_account") or {})
+                    .get("data")
+                    or {}
+                )
                 source_calendars.append(
                     {
                         "id": str(entry.get("id")),
-                        "name": a.get("label") or a.get("name") or a.get("source_id") or a.get("email") or f"Calendar {entry.get('id')}",
-                        "email": a.get("source_id") or a.get("email"),
+                        "name": a.get("label") or a.get("name") or a.get("source_id") or f"Calendar {entry.get('id')}",
+                        # Matching key for events: calendar_event.calendar_id
+                        # equals the source calendar's source_id.
+                        "source_id": a.get("source_id"),
+                        "account_email": accounts.get(str(account.get("id"))),
                         "editable": a.get("editable"),
+                        "default_for_new_events": a.get("default_for_new_events"),
                         "role": a.get("role"),
                         "kind": a.get("kind"),
                     }
@@ -74,12 +97,18 @@ class SkylightCalendarCoordinator(DataUpdateCoordinator):
 class SkylightListsCoordinator(DataUpdateCoordinator):
     """Fetch every list + its items."""
 
-    def __init__(self, hass: HomeAssistant, api: SkylightAPI, frame_id: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: SkylightAPI,
+        frame_id: str,
+        update_interval: int = LISTS_SCAN_INTERVAL,
+    ) -> None:
         super().__init__(
             hass,
             _LOGGER,
             name=f"{DOMAIN} lists {frame_id}",
-            update_interval=timedelta(seconds=LISTS_SCAN_INTERVAL),
+            update_interval=timedelta(seconds=update_interval),
         )
         self.api = api
         self.frame_id = frame_id
@@ -128,17 +157,53 @@ class SkylightListsCoordinator(DataUpdateCoordinator):
 class SkylightSensorCoordinator(DataUpdateCoordinator):
     """Aggregate chores + meals + rewards + categories for sensors and per-member todos."""
 
-    def __init__(self, hass: HomeAssistant, api: SkylightAPI, frame_id: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: SkylightAPI,
+        frame_id: str,
+        update_interval: int = SENSOR_SCAN_INTERVAL,
+    ) -> None:
         super().__init__(
             hass,
             _LOGGER,
             name=f"{DOMAIN} sensors {frame_id}",
-            update_interval=timedelta(seconds=SENSOR_SCAN_INTERVAL),
+            update_interval=timedelta(seconds=update_interval),
         )
         self.api = api
         self.frame_id = frame_id
+        self._features: dict | None = None
+
+    async def _async_load_features(self) -> None:
+        """Cache the frame's ``feature_bundle`` on first use.
+
+        Features track the subscription and hardware, neither of which changes
+        while HA is running, so this is fetched once rather than every poll. A
+        plan change is picked up on reload.
+        """
+        if self._features is not None:
+            return
+        try:
+            resp = await self.api.get_frame(self.frame_id)
+            attrs = (resp.get("data") or {}).get("attributes") or {}
+            self._features = attrs.get("feature_bundle") or {}
+        except (SkylightAuthError, SkylightAPIError) as err:
+            _LOGGER.debug("feature_bundle fetch failed: %s", err)
+            self._features = {}
+
+    def _enabled(self, feature: str) -> bool:
+        """Whether a frame app is switched on.
+
+        Fails open: an unrecognised or missing feature is treated as enabled, so
+        a payload change upstream can never silently blank a working sensor.
+        """
+        entry = (self._features or {}).get(feature)
+        if not isinstance(entry, dict):
+            return True
+        return bool(entry.get("enabled", True))
 
     async def _async_update_data(self) -> dict:
+        await self._async_load_features()
         today = dt_util.now().date()
         week_end = (today + timedelta(days=7)).isoformat()
         result: dict = {
@@ -149,34 +214,42 @@ class SkylightSensorCoordinator(DataUpdateCoordinator):
             "categories": None,
             "task_box": None,
         }
-        try:
-            result["chores"] = await self.api.get_chores(
-                self.frame_id, today.isoformat(), week_end
-            )
-        except (SkylightAuthError, SkylightAPIError) as err:
-            _LOGGER.debug("chores fetch failed: %s", err)
-        try:
-            meals = await self.api.get_meals(
-                self.frame_id, today.isoformat(), week_end
-            )
-            result["meals"] = meals
-            # Preserve JSON:API `included` payload for recipe / category label lookup.
-            if isinstance(meals, dict):
-                result["meals_included"] = meals.get("included", []) or []
-        except (SkylightAuthError, SkylightAPIError) as err:
-            _LOGGER.debug("meals fetch failed: %s", err)
-        try:
-            result["reward_points"] = await self.api.get_reward_points(self.frame_id)
-        except (SkylightAuthError, SkylightAPIError) as err:
-            _LOGGER.debug("reward_points fetch failed: %s", err)
+        # Skipping disabled apps saves a request per poll and, more usefully,
+        # stops a permanent 4xx from a feature this household doesn't have from
+        # looking like a transient failure in the logs.
+        if self._enabled("chores"):
+            try:
+                result["chores"] = await self.api.get_chores(
+                    self.frame_id, today.isoformat(), week_end
+                )
+            except (SkylightAuthError, SkylightAPIError) as err:
+                _LOGGER.debug("chores fetch failed: %s", err)
+            try:
+                result["task_box"] = await self.api.get_task_box(self.frame_id)
+            except (SkylightAuthError, SkylightAPIError) as err:
+                _LOGGER.debug("task_box fetch failed: %s", err)
+        if self._enabled("meal_planning"):
+            try:
+                meals = await self.api.get_meals(
+                    self.frame_id, today.isoformat(), week_end
+                )
+                result["meals"] = meals
+                # Preserve JSON:API `included` payload for recipe / category label lookup.
+                if isinstance(meals, dict):
+                    result["meals_included"] = meals.get("included", []) or []
+            except (SkylightAuthError, SkylightAPIError) as err:
+                _LOGGER.debug("meals fetch failed: %s", err)
+        if self._enabled("rewards"):
+            try:
+                result["reward_points"] = await self.api.get_reward_points(self.frame_id)
+            except (SkylightAuthError, SkylightAPIError) as err:
+                _LOGGER.debug("reward_points fetch failed: %s", err)
+        # Categories are not feature-gated: they name the family members every
+        # other platform keys off.
         try:
             result["categories"] = await self.api.get_categories(self.frame_id)
         except (SkylightAuthError, SkylightAPIError) as err:
             _LOGGER.debug("categories fetch failed: %s", err)
-        try:
-            result["task_box"] = await self.api.get_task_box(self.frame_id)
-        except (SkylightAuthError, SkylightAPIError) as err:
-            _LOGGER.debug("task_box fetch failed: %s", err)
         return result
 
 
@@ -192,12 +265,18 @@ class SkylightFrameCoordinator(DataUpdateCoordinator):
     Data shape: ``{"device_id": "5669988", "attributes": {...}}``
     """
 
-    def __init__(self, hass: HomeAssistant, api: SkylightAPI, frame_id: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: SkylightAPI,
+        frame_id: str,
+        update_interval: int = FRAME_SCAN_INTERVAL,
+    ) -> None:
         super().__init__(
             hass,
             _LOGGER,
             name=f"{DOMAIN} frame {frame_id}",
-            update_interval=timedelta(seconds=FRAME_SCAN_INTERVAL),
+            update_interval=timedelta(seconds=update_interval),
         )
         self.api = api
         self.frame_id = frame_id
@@ -232,12 +311,18 @@ class SkylightFrameCoordinator(DataUpdateCoordinator):
 class SkylightPhotosCoordinator(DataUpdateCoordinator):
     """Fetch latest frame photos (messages feed)."""
 
-    def __init__(self, hass: HomeAssistant, api: SkylightAPI, frame_id: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: SkylightAPI,
+        frame_id: str,
+        update_interval: int = PHOTOS_SCAN_INTERVAL,
+    ) -> None:
         super().__init__(
             hass,
             _LOGGER,
             name=f"{DOMAIN} photos {frame_id}",
-            update_interval=timedelta(seconds=PHOTOS_SCAN_INTERVAL),
+            update_interval=timedelta(seconds=update_interval),
         )
         self.api = api
         self.frame_id = frame_id
